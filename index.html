@@ -447,9 +447,9 @@ let jujaBoundaryLayer = null;
 
 const COND_COLOR = {
   Perfect: '#228B22',
-  Good:    '#32CD32',
+  Good:    '#379155',
   Average: '#FFA500',
-  Poor:    '#EF4444'
+  Poor:    '#c20808'
 };
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -481,7 +481,7 @@ function rciDisplay(val) {
   
   // Poor: RCI <= 0.4 (includes RCI = 0 for density >= 10)
   if (num <= 0.4) {
-    color = '#ef4444';
+    color = '#c20808';
   }
   // Perfect: RCI >= 0.8
   else if (num >= 0.8) {
@@ -489,7 +489,7 @@ function rciDisplay(val) {
   }
   // Good: RCI 0.6 - 0.8
   else if (num >= 0.6) {
-    color = '#32CD32';
+    color = '#379155';
   }
   // Average: RCI 0.4 - 0.6
   else if (num >= 0.4) {
