@@ -3,6 +3,7 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 import psycopg2
 import psycopg2.extras
+from decimal import Decimal
 
 app = Flask(__name__)
 CORS(app)
@@ -10,7 +11,7 @@ CORS(app)
 DB_CONFIG = {
     "host":     os.environ.get("DB_HOST",     "pg-26875239-tooshadrack60.f.aivencloud.com"),
     "port":     os.environ.get("DB_PORT",     "13258"),
-    "dbname":   os.environ.get("DB_NAME",     "defaultdb"),
+    "dbname":   os.environ.get("DB_NAME",     "postgres"),
     "user":     os.environ.get("DB_USER",     "avnadmin"),
     "password": os.environ.get("DB_PASSWORD", "AVNS_-aSNA6qAzg6h5-yFqZA"),
     "sslmode":  os.environ.get("DB_SSLMODE",  "require")
@@ -24,6 +25,20 @@ def get_connection():
         print(f"❌ Database connection error: {e}")
         return None
 
+# Helper function to calculate RCI and condition
+def calculate_rci_condition(density):
+    """Calculate RCI and condition based on density (potholes/km)"""
+    if density == 0:
+        return 1.00, "Perfect", "#228B22"
+    elif density <= 2.0:
+        rci = round(1.0 - (density / 10.0), 2)
+        return rci, "Good", "#32CD32"
+    elif density <= 6.0:
+        rci = round(1.0 - (density / 10.0), 2)
+        return rci, "Average", "#FFA500"
+    else:  # density > 6.0 (including >= 10)
+        return 0.00, "Poor", "#EF4444"
+
 @app.route("/api/health")
 def health():
     return jsonify({"status": "ok", "message": "Road Vision API is running"})
@@ -35,6 +50,7 @@ def get_roads():
         return jsonify({"success": False, "error": "Database connection failed"}), 500
     try:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        # Simplified query without ROUND in SQL - we'll calculate in Python
         cur.execute("""
             WITH latest_inspections AS (
                 SELECT road_gid, MAX(timestamp::date) AS latest_date
@@ -50,33 +66,59 @@ def get_roads():
             SELECT
                 r.gid, r.roadname, r.roadtype, r.roadagency, r.roadcode,
                 r.roadclass, r.county,
-                ROUND(r.length_km::numeric, 2) AS length_km,
-                ROUND(r.length_m::numeric, 0)  AS length_m,
-                COALESCE(cc.pothole_count, 0)  AS pothole_count,
-                CASE WHEN r.length_km > 0
-                     THEN ROUND((COALESCE(cc.pothole_count,0)/NULLIF(r.length_km,0))::numeric,2)
-                     ELSE 0 END AS density_per_km,
-                CASE WHEN r.length_km > 0
-                     THEN ROUND(GREATEST(0,1.0-(COALESCE(cc.pothole_count,0)/NULLIF(r.length_km,0))/10.0)::numeric,2)
-                     ELSE 1.0 END AS rci_value,
-                CASE WHEN r.length_km>0 AND (COALESCE(cc.pothole_count,0)/NULLIF(r.length_km,0))=0    THEN 'Perfect'
-                     WHEN r.length_km>0 AND (COALESCE(cc.pothole_count,0)/NULLIF(r.length_km,0))<=2.0 THEN 'Good'
-                     WHEN r.length_km>0 AND (COALESCE(cc.pothole_count,0)/NULLIF(r.length_km,0))<=6.0 THEN 'Average'
-                     ELSE 'Poor' END AS condition,
-                CASE WHEN r.length_km>0 AND (COALESCE(cc.pothole_count,0)/NULLIF(r.length_km,0))=0    THEN '#228B22'
-                     WHEN r.length_km>0 AND (COALESCE(cc.pothole_count,0)/NULLIF(r.length_km,0))<=2.0 THEN '#32CD32'
-                     WHEN r.length_km>0 AND (COALESCE(cc.pothole_count,0)/NULLIF(r.length_km,0))<=6.0 THEN '#FFA500'
-                     ELSE '#FF0000' END AS road_color,
+                r.length_km,
+                r.length_m,
+                COALESCE(cc.pothole_count, 0) AS pothole_count,
+                CASE 
+                    WHEN r.length_km > 0 
+                    THEN (COALESCE(cc.pothole_count, 0)::float / r.length_km)
+                    ELSE 0 
+                END AS density_per_km,
                 ST_AsGeoJSON(r.geom)::json AS geometry
             FROM parc.jujaroads r
             LEFT JOIN current_counts cc ON r.gid = cc.road_gid
-            WHERE r.geom IS NOT NULL ORDER BY r.roadname ASC
+            WHERE r.geom IS NOT NULL
+            ORDER BY r.roadname ASC
         """)
         rows = cur.fetchall()
-        cur.close(); conn.close()
-        return jsonify({"success": True, "roads": [dict(r) for r in rows]})
+        cur.close()
+        conn.close()
+
+        result_roads = []
+        for row in rows:
+            road = dict(row)
+            
+            # Get density as float
+            density_raw = road.get('density_per_km', 0)
+            if density_raw is None:
+                density = 0.0
+            else:
+                density = float(density_raw)
+            
+            # Round density to 2 decimal places
+            road['density_per_km'] = round(density, 2)
+            
+            # Calculate RCI and condition using Python function
+            rci, condition, color = calculate_rci_condition(density)
+            road['rci_value'] = rci
+            road['condition'] = condition
+            road['road_color'] = color
+            
+            # Round length_km if it exists
+            if road.get('length_km'):
+                road['length_km'] = round(float(road['length_km']), 2)
+            
+            # Debug output for density >= 10
+            if density >= 10.0:
+                print(f"✅ Road {road['roadname']}: Density={density}, RCI={rci}, Condition={condition}")
+            
+            result_roads.append(road)
+
+        return jsonify({"success": True, "roads": result_roads})
     except Exception as e:
         print(f"❌ Error in get_roads: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({"success": False, "error": str(e)}), 500
 
 @app.route("/api/stats")
@@ -88,6 +130,7 @@ def get_stats():
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute("SELECT COUNT(*) as count FROM parc.jujaroads WHERE geom IS NOT NULL")
         total_roads = cur.fetchone()['count']
+        
         cur.execute("""
             WITH latest_inspections AS (
                 SELECT road_gid, MAX(timestamp::date) AS latest_date
@@ -96,35 +139,41 @@ def get_stats():
             current_counts AS (
                 SELECT p.road_gid, COUNT(p.id) AS pothole_count
                 FROM parc.roadpothole p
-                JOIN latest_inspections li ON p.road_gid=li.road_gid
-                    AND p.timestamp::date=li.latest_date
+                JOIN latest_inspections li ON p.road_gid = li.road_gid
+                    AND p.timestamp::date = li.latest_date
                 GROUP BY p.road_gid
             )
             SELECT
-                SUM(COALESCE(cc.pothole_count,0)) as total_potholes,
-                COUNT(CASE WHEN (COALESCE(cc.pothole_count,0)/NULLIF(r.length_km,0))>6.0 THEN 1 END) as poor_roads,
-                COUNT(CASE WHEN (COALESCE(cc.pothole_count,0)/NULLIF(r.length_km,0))>2.0
-                           AND (COALESCE(cc.pothole_count,0)/NULLIF(r.length_km,0))<=6.0 THEN 1 END) as average_roads,
-                COUNT(CASE WHEN COALESCE(cc.pothole_count,0)>0
-                           AND (COALESCE(cc.pothole_count,0)/NULLIF(r.length_km,0))<=2.0 THEN 1 END) as good_roads,
-                COUNT(CASE WHEN COALESCE(cc.pothole_count,0)=0 THEN 1 END) as perfect_roads
+                SUM(COALESCE(cc.pothole_count, 0)) as total_potholes,
+                COUNT(CASE WHEN (COALESCE(cc.pothole_count, 0)::float / NULLIF(r.length_km, 0)) > 6.0 THEN 1 END) as poor_roads,
+                COUNT(CASE WHEN (COALESCE(cc.pothole_count, 0)::float / NULLIF(r.length_km, 0)) > 2.0
+                           AND (COALESCE(cc.pothole_count, 0)::float / NULLIF(r.length_km, 0)) <= 6.0 THEN 1 END) as average_roads,
+                COUNT(CASE WHEN COALESCE(cc.pothole_count, 0) > 0
+                           AND (COALESCE(cc.pothole_count, 0)::float / NULLIF(r.length_km, 0)) <= 2.0 THEN 1 END) as good_roads,
+                COUNT(CASE WHEN COALESCE(cc.pothole_count, 0) = 0 THEN 1 END) as perfect_roads
             FROM parc.jujaroads r
-            LEFT JOIN current_counts cc ON r.gid=cc.road_gid
-            WHERE r.length_km>0
+            LEFT JOIN current_counts cc ON r.gid = cc.road_gid
+            WHERE r.length_km > 0
         """)
         stats = cur.fetchone()
-        cur.close(); conn.close()
-        return jsonify({"success": True, "stats": {
-            "total_roads":    total_roads or 0,
-            "total_potholes": stats['total_potholes'] or 0,
-            "poor_roads":     stats['poor_roads'] or 0,
-            "average_roads":  stats['average_roads'] or 0,
-            "good_roads":     stats['good_roads'] or 0,
-            "perfect_roads":  stats['perfect_roads'] or 0
-        }})
+        cur.close()
+        conn.close()
+
+        return jsonify({
+            "success": True,
+            "stats": {
+                "total_roads": total_roads or 0,
+                "total_potholes": int(stats['total_potholes']) if stats['total_potholes'] else 0,
+                "poor_roads": int(stats['poor_roads']) if stats['poor_roads'] else 0,
+                "average_roads": int(stats['average_roads']) if stats['average_roads'] else 0,
+                "good_roads": int(stats['good_roads']) if stats['good_roads'] else 0,
+                "perfect_roads": int(stats['perfect_roads']) if stats['perfect_roads'] else 0
+            }
+        })
     except Exception as e:
         print(f"❌ Error in get_stats: {e}")
-        import traceback; traceback.print_exc()
+        import traceback
+        traceback.print_exc()
         return jsonify({"success": False, "error": str(e)}), 500
 
 @app.route("/api/juja_boundary")
@@ -136,7 +185,9 @@ def get_juja_boundary():
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute("SELECT ST_AsGeoJSON(ST_Collect(geom))::json as boundary_geojson FROM parc.juja WHERE geom IS NOT NULL")
         row = cur.fetchone()
-        cur.close(); conn.close()
+        cur.close()
+        conn.close()
+        
         if row and row['boundary_geojson']:
             return jsonify({"success": True, "boundary": row['boundary_geojson']})
         return jsonify({"success": False, "error": "No boundary data found"})
@@ -146,38 +197,62 @@ def get_juja_boundary():
 @app.route("/api/timeline")
 def get_timeline():
     try:
-        road_gid  = request.args.get('road_gid')
+        road_gid = request.args.get('road_gid')
         date_from = request.args.get('from', '2020-01-01')
-        date_to   = request.args.get('to',   '2099-12-31')
+        date_to = request.args.get('to', '2099-12-31')
+        
         if not road_gid:
             return jsonify({"success": False, "error": "road_gid is required"}), 400
+        
         conn = get_connection()
         if not conn:
             return jsonify({"success": False, "error": "Database connection failed"}), 500
+        
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute("""
-            SELECT p.timestamp::date AS period, COUNT(p.id) AS pothole_count,
-                CASE WHEN r.length_km>0
-                     THEN ROUND(GREATEST(0,1.0-(COUNT(p.id)::float/r.length_km)/10.0)::numeric,2)
-                     ELSE 1.0 END AS rci_value
+            SELECT 
+                p.timestamp::date AS period, 
+                COUNT(p.id) AS pothole_count,
+                r.length_km
             FROM parc.roadpothole p
-            JOIN parc.jujaroads r ON p.road_gid=r.gid
-            WHERE p.road_gid=%s AND p.timestamp>=%s AND p.timestamp<=%s
-            GROUP BY p.timestamp::date, r.length_km ORDER BY period ASC
+            JOIN parc.jujaroads r ON p.road_gid = r.gid
+            WHERE p.road_gid = %s AND p.timestamp >= %s AND p.timestamp <= %s
+            GROUP BY p.timestamp::date, r.length_km
+            ORDER BY period ASC
         """, (road_gid, date_from, date_to))
         timeline_points = cur.fetchall()
+        
+        # Calculate density, RCI, and condition for each point
+        for point in timeline_points:
+            potholes = int(point['pothole_count'])
+            length_km = float(point['length_km']) if point['length_km'] else 1.0
+            density = potholes / length_km if length_km > 0 else 0
+            point['density_per_km'] = round(density, 2)
+            
+            rci, condition, _ = calculate_rci_condition(density)
+            point['rci_value'] = rci
+            point['condition'] = condition
+        
         cur.execute("""
             SELECT COUNT(p.id) AS current_potholes FROM parc.roadpothole p
             WHERE p.road_gid=%s AND p.timestamp>=%s AND p.timestamp<=%s
-              AND p.timestamp::date=(
+              AND p.timestamp::date = (
                   SELECT MAX(timestamp::date) FROM parc.roadpothole
                   WHERE road_gid=%s AND timestamp>=%s AND timestamp<=%s)
         """, (road_gid, date_from, date_to, road_gid, date_from, date_to))
         cr = cur.fetchone()
-        cur.close(); conn.close()
-        return jsonify({"success": True, "points": [dict(r) for r in timeline_points],
-                        "current_potholes": cr['current_potholes'] if cr else 0})
+        cur.close()
+        conn.close()
+        
+        return jsonify({
+            "success": True,
+            "points": [dict(r) for r in timeline_points],
+            "current_potholes": int(cr['current_potholes']) if cr and cr['current_potholes'] else 0
+        })
     except Exception as e:
+        print(f"❌ Error in get_timeline: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({"success": False, "error": str(e)}), 500
 
 @app.route("/api/analysis")
@@ -186,15 +261,15 @@ def get_analysis():
     if not conn:
         return jsonify({"success": False, "error": "Database connection failed"}), 500
     try:
-        road_gid  = request.args.get('road_gid')
+        road_gid = request.args.get('road_gid')
         date_from = request.args.get('from', '2020-01-01')
-        date_to   = request.args.get('to',   '2099-12-31')
+        date_to = request.args.get('to', '2099-12-31')
+        
         if not road_gid:
             return jsonify({"success": False, "error": "road_gid is required"}), 400
 
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
-        # Road info
         cur.execute("""
             SELECT gid, roadname, roadtype, roadagency, roadcode, roadclass, length_km
             FROM parc.jujaroads WHERE gid = %s
@@ -203,72 +278,79 @@ def get_analysis():
         if not road_info:
             return jsonify({"success": False, "error": "Road not found"}), 404
 
-        # Monthly condition data
         cur.execute("""
             SELECT
-                DATE_TRUNC('month', p.timestamp)      AS month,
-                COUNT(p.id)                           AS pothole_count,
-                r.length_km,
-                CASE
-                    WHEN r.length_km > 0 AND COUNT(p.id) = 0                               THEN 'Perfect'
-                    WHEN r.length_km > 0 AND (COUNT(p.id)::float / r.length_km) <= 2.0     THEN 'Good'
-                    WHEN r.length_km > 0 AND (COUNT(p.id)::float / r.length_km) <= 6.0     THEN 'Average'
-                    ELSE 'Poor'
-                END AS condition,
-                ROUND(GREATEST(0, 1.0-(COUNT(p.id)::float/r.length_km)/10.0)::numeric, 2)  AS rci_value,
-                ROUND((COUNT(p.id)::float / NULLIF(r.length_km,0))::numeric, 2)             AS density_per_km
+                DATE_TRUNC('month', p.timestamp) AS month,
+                COUNT(p.id) AS pothole_count,
+                r.length_km
             FROM parc.roadpothole p
             JOIN parc.jujaroads r ON p.road_gid = r.gid
             WHERE p.road_gid = %s
-              AND p.timestamp >= %s
-              AND p.timestamp <= %s
-            GROUP BY DATE_TRUNC('month', p.timestamp), r.length_km, r.gid
+                AND p.timestamp >= %s
+                AND p.timestamp <= %s
+            GROUP BY DATE_TRUNC('month', p.timestamp), r.length_km
             ORDER BY month ASC
         """, (road_gid, date_from, date_to))
         rows = cur.fetchall()
-        cur.close(); conn.close()
+        cur.close()
+        conn.close()
 
+        print(f"\n{'='*60}")
+        print(f"🔍 ANALYSIS FOR ROAD: {road_info['roadname']}")
+        print(f"{'='*60}")
+        
         condition_counts = {'Perfect': 0, 'Good': 0, 'Average': 0, 'Poor': 0}
-        for row in rows:
-            c = row['condition']
-            condition_counts[c] = condition_counts.get(c, 0) + 1
-
-        dominant_condition = max(condition_counts, key=condition_counts.get) if rows else 'N/A'
-
         data = []
+        
         for row in rows:
+            month_str = row['month'].strftime('%b %Y')
             potholes = int(row['pothole_count'])
-            density  = float(row['density_per_km']) if row['density_per_km'] else 0
-            rci      = float(row['rci_value'])       if row['rci_value']      else 1.0
-            condition= row['condition']
-
+            length_km = float(row['length_km']) if row['length_km'] else 1.0
+            density = potholes / length_km if length_km > 0 else 0
+            
+            rci, condition, _ = calculate_rci_condition(density)
+            
+            if density >= 10.0:
+                print(f"✅ {month_str}: Density={density:.2f} → RCI={rci:.2f}, Condition={condition}")
+            else:
+                print(f"   {month_str}: Density={density:.2f} → RCI={rci:.2f}, Condition={condition}")
+            
+            condition_counts[condition] = condition_counts.get(condition, 0) + 1
+            
             data.append({
-                'month':         row['month'].strftime('%Y-%m'),
-                'month_display': row['month'].strftime('%b %Y'),
-                'potholes':      potholes,
-                'density':       density,
-                'rci':           rci,
-                'condition':     condition
+                'month': row['month'].strftime('%Y-%m'),
+                'month_display': month_str,
+                'potholes': potholes,
+                'density': round(density, 2),
+                'rci': rci,
+                'condition': condition
             })
 
+        dominant_condition = max(condition_counts, key=condition_counts.get) if data else 'N/A'
+        
+        print(f"\n📊 SUMMARY: {condition_counts}")
+        print(f"🏆 Dominant Condition: {dominant_condition}")
+        print(f"{'='*60}\n")
+
         return jsonify({
-            "success":            True,
+            "success": True,
             "road_info": {
-                "name":      road_info['roadname'],
-                "type":      road_info['roadtype'],
-                "agency":    road_info['roadagency'],
-                "code":      road_info['roadcode'],
-                "class":     road_info['roadclass'],
+                "name": road_info['roadname'],
+                "type": road_info['roadtype'] or '',
+                "agency": road_info['roadagency'] or '',
+                "code": road_info['roadcode'] or '',
+                "class": road_info['roadclass'] or '',
                 "length_km": float(road_info['length_km']) if road_info['length_km'] else 0
             },
-            "data":               data,
-            "months_tracked":     len(data),
+            "data": data,
+            "months_tracked": len(data),
             "dominant_condition": dominant_condition,
-            "condition_counts":   condition_counts
+            "condition_counts": condition_counts
         })
     except Exception as e:
         print(f"❌ Error in get_analysis: {e}")
-        import traceback; traceback.print_exc()
+        import traceback
+        traceback.print_exc()
         return jsonify({"success": False, "error": str(e)}), 500
 
 if __name__ == "__main__":
